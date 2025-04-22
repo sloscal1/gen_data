@@ -1,0 +1,79 @@
+frequencies: [0.1, 0.5, 1, 7, 30, 90, 365]
+segment_approval_rate: [0.95, 0.9, 0.98, 0.97, 0.99, 0.96] 
+merchants:
+  num_low: 1000
+  num_med: 1000
+  num_high: 1000
+  zipf_alpha: 2.2
+  low_bound: 50
+  high_bound: 200
+customer:
+  transaction_types: ["cp", "cnp", "contactless", "tokenized", "atm", "recurring"]
+  start_date_offset: 180
+  end_date_offset: 365
+  overall_trxns_low: 1
+  overall_trxns_high: 5000
+  cp_frequencies: [0.01, 0.1, 0.2, 0.3, 0.2, 0.1, 0.09]
+  cp_time_of_day_start: 6
+  cp_time_of_day_end: 22
+  cp_amount_low: 1 
+  cp_amount_high: 400
+  cnp_frequencies: [0, 0.05, 0.1, 0.2, 0.3, 0.2, 0.15]
+  cnp_time_of_day_start: 0
+  cnp_time_of_day_end: 24
+  cnp_amount_low: 1
+  cnp_amount_high: 2000
+  contactless_frequencies: [0.1, 0.1, 0.2, 0.3, 0.2, 0.05, 0.05]
+  contactless_time_of_day_start: 6
+  contactless_time_of_day_end: 24
+  contactless_amount_low: 5
+  contactless_amount_high: 2000
+  tokenized_frequencies: [0.1, 0.1, 0.2, 0.25, 0.15, 0.1, 0.1]
+  tokenized_time_of_day_start: 0
+  tokenized_time_of_day_end: 24
+  tokenized_amount_low: 5
+  tokenized_amount_high: 2000
+  atm_frequencies: [0, 0.05, 0.1, 0.2, 0.3, 0.2, 0.15]
+  atm_time_of_day_start: 8
+  atm_time_of_day_end: 22
+  atm_amount_low: 1
+  atm_amount_high: 2000
+  atm_amounts: [20, 40, 80, 100, 200]
+  recurring_frequencies: [0.05, 0.05, 0.05, 0.05, 0.5, 0.2, 0.1]
+  recurring_time_of_day_start: 6
+  recurring_time_of_day_end: 24
+  recurring_amount_low: 5
+  recurring_amount_high: 2000
+cp_fraud:
+  transaction_types: ["cp", "contactless", "atm"]
+  overall_trxns_low: 1
+  overall_trxns_high: 5000
+  cp_time_of_day_start: 0
+  cp_time_of_day_end: 24
+  cp_amount_low: 20
+  cp_amount_high: 400
+  contactless_time_of_day_start: 0
+  contactless_time_of_day_end: 24
+  contactless_amount_low: 20
+  contactless_amount_high: 2000
+  atm_time_of_day_start: 0
+  atm_time_of_day_end: 24
+  atm_amount_low: 40
+  atm_amount_high: 2000
+  atm_amounts: [40, 80, 100, 200]
+cnp_fraud:
+  transaction_types: ["cnp", "tokenized", "recurring"]
+  overall_trxns_low: 1
+  overall_trxns_high: 5000
+  cnp_time_of_day_start: 0
+  cnp_time_of_day_end: 24
+  cnp_amount_low: 1
+  cnp_amount_high: 2000
+  tokenized_time_of_day_start: 0
+  tokenized_time_of_day_end: 24
+  tokenized_amount_low: 5
+  tokenized_amount_high: 2000
+  recurring_time_of_day_start: 0
+  recurring_time_of_day_end: 24
+  recurring_amount_low: 5
+  recurring_amount_high: 2000

@@ -1,16 +1,26 @@
+import pathlib
 from collections import defaultdict
 from typing import Dict, List, Tuple
 
+import matplotlib.pyplot as plt  # type: ignore
+import mlflow.xgboost
 import optuna
 import optuna.integration
 import pandas as pd
 import plotly.graph_objects as go  # type: ignore
+import shap  # type: ignore
 import xgboost as xgb
+from optuna.integration.mlflow import MLflowCallback
 from sklearn.metrics import (  # type: ignore
     auc,
     average_precision_score,
     precision_recall_curve,
 )
+
+import mlflow
+
+results_dir = pathlib.Path("results")
+parent_id: str = ""
 
 num_boost_round = 10
 default_fraud_rate = 0.0015
@@ -25,7 +35,8 @@ hyperparameters = {
     "alpha": ("suggest_float", 1e-3, 10, True),
 }
 unused_for_training = [
-    "fraud_label",
+    "approved",
+    "final_fraud",
     "transaction_timestamp",
     "card_id",
     "transaction_id",
@@ -33,7 +44,10 @@ unused_for_training = [
     "fraud_on_card",
     "compromised_date",
     "first_fraud",
+    "fraud",
 ]
+target = "final_fraud"
+mlflow_callback = MLflowCallback(metric_name="aucpr")
 
 
 data = pd.DataFrame()
@@ -48,7 +62,7 @@ def generate_temporal_folds(
 
     # Create temporal folds
     fold_size = len(data) // (n_splits + 1)  # There is always a holdout set
-    folds = []
+    folds: List[Tuple[int, int]] = []
     for i in range(n_splits):
         end_idx = (i + 1) * fold_size
         folds.append((i, end_idx))
@@ -72,6 +86,13 @@ def generate_temporal_folds(
                     fold_data.groupby(col, observed=True)[target].mean().to_dict()
                 )
                 target_encoded[fold][col] = encoding_map
+    for fold, train_end in folds:
+        print(
+            f"Fold {fold}: {len(data.iloc[:train_end])} train transactions, "
+            f"{data.iloc[:train_end][target].sum()} train fraud transactions "
+            f"{len(data.iloc[train_end:])} test transactions, "
+            f"{data.iloc[train_end:][target].sum()} test fraud transactions"
+        )
 
     return folds
 
@@ -116,45 +137,57 @@ def objective(trial: optuna.Trial) -> float:
         "objective": "binary:logistic",
         "eval_metric": "aucpr",
         "booster": "gbtree",
+        "random_state": 1337,
         **param,
     }
 
     # Sort data by transaction_timestamp for temporal holdout
     data_sorted = prepare_data(data)
-    folds = generate_temporal_folds(data_sorted, "fraud_label")
+    folds = generate_temporal_folds(data_sorted, target)
 
-    # Split into train and test based on temporal order
-    aucpr = []
-    for fold, stop_index in folds:
-        train_data = data_sorted.iloc[:stop_index]
-        test_data = data_sorted.iloc[stop_index:]
-        X_train, y_train = (
-            train_data.drop(columns=unused_for_training),
-            train_data["fraud_label"],
-        )
-        X_test, y_test = (
-            test_data.drop(
-                columns=unused_for_training,
-            ),
-            test_data["fraud_label"],
-        )
-        X_train = apply_target_encoding(X_train, fold)
-        X_test = apply_target_encoding(X_test, fold)
-        dtrain = xgb.DMatrix(X_train, label=y_train)
-        dtest = xgb.DMatrix(X_test, label=y_test)
+    # Start MLflow run
+    with mlflow.start_run(parent_run_id=parent_id, nested=True):
+        mlflow.log_params(param)
+        aucpr = []
+        for fold, stop_index in folds:
+            train_data = data_sorted.iloc[:stop_index]
+            test_data = data_sorted.iloc[stop_index:]
+            X_train, y_train = (
+                train_data.drop(columns=unused_for_training, errors="ignore"),
+                train_data[target],
+            )
+            X_test, y_test = (
+                test_data.drop(
+                    columns=unused_for_training,
+                    errors="ignore",
+                ),
+                test_data[target],
+            )
+            X_train = apply_target_encoding(X_train, fold)
+            X_test = apply_target_encoding(X_test, fold)
+            dtrain = xgb.DMatrix(X_train, label=y_train)
+            dtest = xgb.DMatrix(X_test, label=y_test)
 
-        # pruning = optuna.integration.XGBoostPruningCallback(trial, "validation-aucpr")
+            pruning = optuna.integration.XGBoostPruningCallback(trial, "train-aucpr")
 
-        model = xgb.train(
-            param,
-            dtrain,
-            num_boost_round=num_boost_round,
-            verbose_eval=False,
-            # callbacks=[pruning],
-        )
-        preds = model.predict(dtest)
-        aucpr.append(average_precision_score(y_test, preds))
-    return sum(aucpr) / len(aucpr)
+            model = xgb.train(
+                param,
+                dtrain=dtrain,
+                maximize=True,
+                num_boost_round=num_boost_round,
+                callbacks=[pruning],
+                evals=[(dtrain, "train")],
+            )
+
+            preds = model.predict(dtest)
+            aucpr.append(average_precision_score(y_test, preds))
+
+        # Retrieve the study from the trial
+        current_value = sum(aucpr) / len(aucpr)
+        mlflow.log_metric("aucpr", current_value)
+        if len(trial.study.get_trials()) == 1 or current_value > trial.study.best_value:
+            model.save_model(results_dir / "xgb.json")
+    return current_value
 
 
 def prepare_data(data: pd.DataFrame) -> pd.DataFrame:
@@ -172,7 +205,7 @@ def prepare_data(data: pd.DataFrame) -> pd.DataFrame:
             - "merchant_id"
             - "merchant_name"
             - "customer_id"
-            - "location"
+            - "zip_code"
             - "transaction_type"
             - "transaction_timestamp"
 
@@ -186,7 +219,7 @@ def prepare_data(data: pd.DataFrame) -> pd.DataFrame:
         "merchant_id",
         "merchant_name",
         "customer_id",
-        "location",
+        "zip_code",
         "transaction_type",
     ]
     for col in categorical_cols:
@@ -201,69 +234,31 @@ def prepare_data(data: pd.DataFrame) -> pd.DataFrame:
     return data
 
 
-def main() -> None:
-    # Load the dataset
-    global data
-    data = pd.read_csv("synthetic_transactions.csv")
-
-    # Run Optuna optimization
-    study = optuna.create_study(direction="maximize")
-    study.optimize(
-        objective,
-        n_trials=n_trials,
-    )
-
-    # Best parameters
-    print("Best parameters:", study.best_params)
-
-    # Train final model with best parameters and plot AUCPR
-    best_params = study.best_params
-    best_params["objective"] = "binary:logistic"
-    best_params["eval_metric"] = "aucpr"
-
-    # Sort data by transaction_timestamp for temporal holdout
-    data_sorted = prepare_data(data)
-    folds = generate_temporal_folds(data_sorted, "fraud_label", n_splits=5)
-
-    train_data = data_sorted.iloc[: folds[-1][1]]
-    test_data = data_sorted.iloc[folds[-1][1] :]
-    X_train, y_train = (
-        train_data.drop(
-            columns=unused_for_training,
-        ),
-        train_data["fraud_label"],
-    )
-    X_test, y_test = (
-        test_data.drop(
-            columns=unused_for_training,
-        ),
-        test_data["fraud_label"],
-    )
-    X_train = apply_target_encoding(X_train, folds[-1][0])
-    X_test = apply_target_encoding(X_test, folds[-1][0])
-    print(X_test.columns)
-    dtrain = xgb.DMatrix(X_train, label=y_train)
-    dtest = xgb.DMatrix(X_test, label=y_test)
-    model = xgb.train(
-        best_params,
-        dtrain,
-        num_boost_round=num_boost_round,
-        verbose_eval=False,
-        # callbacks=[pruning],
-    )
-    preds = model.predict(dtest)
-
-    precision, recall, _ = precision_recall_curve(y_test, preds)
-    aucpr = auc(recall, precision)
-    precision_list = [precision]
-    recall_list = [recall]
-    aucpr_list = [aucpr]
-
+def plot_aucpr(
+    precision_list: List[float],
+    recall_list: List[float],
+    aucpr_list: List[float],
+    y_test: pd.Series,
+) -> go.Figure:
     # Plot PR curve
     fig = go.Figure()
 
-    for precision, recall in zip(precision_list, recall_list):
-        fig.add_trace(go.Scatter(x=recall, y=precision, mode="lines", opacity=0.3))
+    for precision, recall, line_color, name in zip(
+        precision_list,
+        recall_list,
+        ["red"] + ["black"] * (len(precision_list) - 1),
+        ["True Label", "Observed Label"],
+    ):
+        fig.add_trace(
+            go.Scatter(
+                x=recall,
+                y=precision,
+                mode="lines",
+                opacity=0.3,
+                line=dict(color=line_color),
+                name=name,
+            )
+        )
 
     baseline_aucpr = y_test.sum() / len(y_test)
     fig.add_trace(
@@ -283,11 +278,101 @@ def main() -> None:
         yaxis_title="Precision",
         template="plotly_white",
     )
-    fig.show()
-
-    fig = optuna.visualization.plot_slice(study, params=hyperparameters)
-    fig.show()
+    return fig
 
 
-if __name__ == "__main__":
-    main()
+def plot_shap_values(model, X_test: pd.DataFrame, class_names: List[str]) -> plt.Figure:
+    # Calculate SHAP values
+    explainer = shap.TreeExplainer(model)
+    shap_values = explainer.shap_values(X_test)
+
+    # Plot SHAP summary plot
+    shap.summary_plot(shap_values, X_test, show=False, class_names=class_names)
+    plt.title("SHAP Summary Plot")
+    plt.xlabel("SHAP Feature Importance Value")
+    plt.ylabel("Feature Name")
+    return plt.gcf()
+
+
+def train_model(imbalance: float, fraud_noise: float, non_fraud_noise: float) -> None:
+    if not results_dir.exists():
+        results_dir.mkdir(parents=True)
+    name_suffix = f"_{imbalance:0.2f}_{fraud_noise:0.2f}_{non_fraud_noise:0.2f}"
+    # Load the dataset
+    global data
+    data = pd.read_csv(
+        "generated_data/"
+        f"transactions_imbalance_{imbalance:0.2f}"
+        f"_fraud_noise_{fraud_noise:0.2f}"
+        f"_non_fraud_noise_{non_fraud_noise:0.2f}.csv"
+    )
+
+    # Start MLflow experiment
+    mlflow.set_tracking_uri("http://127.0.0.1:8080")
+    mlflow.set_experiment("fraud_detection")
+    with mlflow.start_run() as parent_run:
+        global parent_id
+        parent_id = parent_run.info.run_id
+        mlflow.log_param("imbalance", imbalance)
+        mlflow.log_param("fraud_noise", fraud_noise)
+        mlflow.log_param("non_fraud_noise", non_fraud_noise)
+
+        # Check if the study file exists
+        study_path = results_dir / f"study{name_suffix}.pkl"
+        storage_name = f"sqlite:///{study_path}.db"
+        study = optuna.create_study(
+            study_name=f"study{name_suffix}", storage=storage_name, load_if_exists=True
+        )
+        study.optimize(
+            objective,
+            n_trials=n_trials,
+        )
+        # Save the study to a file
+        study.trials_dataframe().to_csv(study_path, index=False)
+        if (results_dir / "xgb.json").exists():
+            (results_dir / "xgb.json").rename(results_dir / f"xgb{name_suffix}.json")
+
+        # Log Optuna study results
+        mlflow.log_artifact(str(study_path))
+
+        # Sort data by transaction_timestamp for temporal holdout
+        data_sorted = prepare_data(data)
+        folds = generate_temporal_folds(data_sorted, target, n_splits=5)
+
+        test_data = data_sorted.iloc[folds[-1][1] :]
+        X_test, y_test = (
+            test_data.drop(columns=unused_for_training, errors="ignore"),
+            test_data[target],
+        )
+        X_test = apply_target_encoding(X_test, folds[-1][0])
+        dtest = xgb.DMatrix(X_test, label=y_test)
+        model = xgb.Booster()
+        model.load_model(results_dir / f"xgb{name_suffix}.json")
+        # Save and log the model
+        mlflow.xgboost.log_model(
+            model, artifact_path="model.json", input_example=X_test
+        )
+        preds = model.predict(dtest)
+
+        precision_list, recall_list, aucpr_list = [], [], []
+        for baseline in [test_data["fraud"], y_test]:
+            precision, recall, _ = precision_recall_curve(baseline, preds)
+            aucpr = auc(recall, precision)
+            precision_list.append(precision)
+            recall_list.append(recall)
+            aucpr_list.append(aucpr)
+
+        # Log final metrics
+        mean_aucpr = sum(aucpr_list) / len(aucpr_list)
+        mlflow.log_metric("final_mean_aucpr", mean_aucpr)
+        mlflow.log_figure(
+            plot_shap_values(model, X_test, ["non-fraud", "fraud"]),
+            f"shap_summary{name_suffix}.png",
+        )
+        mlflow.log_figure(
+            plot_aucpr(precision_list, recall_list, aucpr_list, y_test), "aucpr.png"
+        )
+        mlflow.log_figure(
+            optuna.visualization.plot_slice(study, params=hyperparameters),
+            "optuna_slice.png",
+        )
